@@ -1,5 +1,4 @@
 import os
-import glob
 import hashlib
 import tiktoken
 from typing import List, Dict, Any, Generator
@@ -172,7 +171,7 @@ class LocalRAGEngine:
             # Simple truncation
             current_tokens = 0
             truncated_docs = []
-            max_tokens = 3000
+            max_tokens = settings.max_context_characters // 4
             try:
                 enc = tiktoken.get_encoding("cl100k_base")
             except Exception:

@@ -1,23 +1,25 @@
 import os
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Core Directories & Connections
     data_dir: str = "./data"
-    vector_store_url: str = "http://localhost:6333"
-    ollama_base_url: str = "http://localhost:11434"
+    vector_store_url: str = Field("http://localhost:6333", alias="VECTOR_STORE_URL")
+    ollama_base_url: str = Field("http://localhost:11434", alias="OLLAMA_BASE_URL")
 
     # Embeddings & Retrieval
-    embedding_model: str = "all-MiniLM-L6-v2"
-    chunk_percentile: int = 90
+    embedding_model: str = Field("sentence-transformers/all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
+    chunk_percentile: int = Field(90, alias="CHUNK_PERCENTILE")
     retriever_k: int = 10
 
     # Cross-Encoder
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    reranker_top_n: int = 3
+    reranker_top_n: int = Field(3, alias="RERANK_TOP_N")
+    max_context_characters: int = Field(12000, alias="MAX_CONTEXT_CHARACTERS")
 
     # LLM Settings
-    llm_model: str = "llama3.2"
+    llm_model: str = Field("llama3.2", alias="LLM_MODEL")
     llm_temperature: float = 0.0
     llm_num_ctx: int = 4096
 
