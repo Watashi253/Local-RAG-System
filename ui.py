@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import uuid
 from src.engine import LocalRAGEngine
 from src.exceptions import OffTopicException
 from langchain_core.messages import HumanMessage, AIMessage
@@ -25,6 +26,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Initialize Session State
+if "session_id" not in st.session_state:
+    st.session_state.session_id = f"tenant_{uuid.uuid4().hex}"
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 if "chat_history" not in st.session_state:
@@ -34,12 +37,11 @@ if "uploaded_filenames" not in st.session_state:
 
 # Instantiate Engine safely with history_aware=True and persistent session_id
 @st.cache_resource
-def get_engine():
-    # Use a persistent session ID so PDFs aren't lost across reloads/new chats
-    return LocalRAGEngine(session_id="global_user_session", history_aware=True)
+def get_engine(session_id: str):
+    return LocalRAGEngine(session_id=session_id, history_aware=True)
 
 try:
-    engine = get_engine()
+    engine = get_engine(st.session_state.session_id)
 except Exception as e:
     st.error(f"Could not connect to backend vector database or LLM services. Error: {e}")
     st.stop()
@@ -59,12 +61,32 @@ with st.sidebar:
         st.session_state["chat_history"] = []
         st.rerun()
         
-    st.markdown("### Context Library")
-    if st.session_state["uploaded_filenames"]:
-        for f in st.session_state["uploaded_filenames"]:
-            st.markdown(f"📄 `{f}`")
-    else:
-        st.markdown("<span style='color: #64748B; font-size: 0.9em;'>*No documents loaded yet.*</span>", unsafe_allow_html=True)
+    st.markdown("---")
+    with st.sidebar.expander("📁 Manage Ingested Documents", expanded=True):
+        if not st.session_state.get("uploaded_filenames"):
+            st.caption("No context files loaded in current isolated workspace.")
+        else:
+            # Loop through active session elements and present targeted trash hooks
+            for filename in list(st.session_state.uploaded_filenames):
+                col1, col2 = st.columns([4, 1])
+                
+                # Truncate string gracefully for UI scannability
+                display_name = filename if len(filename) <= 20 else f"{filename[:17]}..."
+                col1.text(f"📄 {display_name}")
+                
+                # Wire up the button to invoke the backend deletion mechanism
+                if col2.button("🗑️", key=f"del_{filename}"):
+                    try:
+                        # Invoke backend Qdrant vector wipe strategy
+                        engine.delete_document(filename)
+                        
+                        # Evict from active state arrays tracking current page history
+                        st.session_state.uploaded_filenames.remove(filename)
+                        
+                        st.sidebar.success(f"Removed reference vector space: {filename}")
+                        st.rerun()
+                    except Exception as e:
+                        st.sidebar.error(f"Could not purge vector chunks: {str(e)}")
 
 # Main Chat Interface
 if not st.session_state["messages"]:
@@ -100,26 +122,21 @@ if prompt_data:
     
     # Process files if staged
     if uploaded_files:
-        for f in uploaded_files:
+        progress_bar = st.progress(0, text="Starting ingestion...")
+        total_files = len(uploaded_files)
+        
+        for idx, f in enumerate(uploaded_files):
             active_filenames.append(f.name)
             st.session_state["uploaded_filenames"].add(f.name)
+            progress_bar.progress((idx) / total_files, text=f"Ingesting {f.name}...")
             try:
-                file_path = os.path.join(engine.user_data_dir, f.name)
-                with open(file_path, "wb") as f_out:
-                    f_out.write(f.read())
+                file_bytes = f.read()
+                engine.ingest_single_document(f.name, file_bytes)
             except Exception as e:
-                st.error(f"Failed to save file {f.name}: {str(e)}")
+                st.error(f"Failed to ingest file {f.name}: {str(e)}")
                 st.stop()
-        
-        # Re-run the engine's ingestion pipeline
-        with st.spinner("Processing documents..."):
-            engine.vectorstore = engine._load_and_verify_documents()
-            if engine.vectorstore != "NO_DOCS":
-                engine.retriever = engine.vectorstore.as_retriever(
-                    search_type="mmr",
-                    search_kwargs={"k": 3, "fetch_k": 9, "lambda_mult": 0.6}
-                )
-                engine._setup_lcel_graph()
+                
+        progress_bar.progress(1.0, text="Ingestion complete!")
                 
     st.session_state["messages"].append({
         "role": "user",

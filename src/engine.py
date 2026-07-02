@@ -43,6 +43,8 @@ class LocalRAGEngine:
         self.qdrant_client = QdrantClient(url=settings.vector_store_url)
         
         # 3. Multi-Tenant Collection Isolation
+        self.ingested_hashes = set()
+        has_docs = False
         if not self.qdrant_client.collection_exists(collection_name=self.session_id):
             # all-MiniLM-L6-v2 outputs 384 dimensions
             self.qdrant_client.create_collection(
@@ -50,118 +52,29 @@ class LocalRAGEngine:
                 vectors_config=VectorParams(size=384, distance=Distance.COSINE),
                 sparse_vectors_config={"sparse": models.SparseVectorParams(modifier=models.Modifier.IDF)},
             )
+        else:
+            collection_info = self.qdrant_client.get_collection(self.session_id)
+            if collection_info.points_count > 0:
+                has_docs = True
+            scroll_results, _ = self.qdrant_client.scroll(
+                collection_name=self.session_id,
+                scroll_filter=None,
+                with_payload=["file_hash"],
+                limit=10000
+            )
+            for record in scroll_results:
+                if record.payload and "file_hash" in record.payload:
+                    self.ingested_hashes.add(record.payload["file_hash"])
             
-        self.vectorstore = self._load_and_verify_documents()
         self.cross_encoder = HuggingFaceCrossEncoder(model_name=settings.reranker_model)
         self.llm = ChatOllama(model=settings.llm_model, base_url=settings.ollama_base_url, temperature=settings.llm_temperature, num_ctx=settings.llm_num_ctx)
         
-        if self.vectorstore != "NO_DOCS":
-            self.retriever = self.vectorstore.as_retriever(
-                search_type="mmr",
-                search_kwargs={
-                    "k": settings.retriever_k,
-                    "fetch_k": settings.retriever_k * 3,
-                    "lambda_mult": 0.6
-                }
-            )
-            self._setup_lcel_graph()
+        self.vectorstore = "NO_DOCS"
+        if has_docs:
+            self._init_vectorstore()
 
-    @staticmethod
-    def _compute_file_hash(file_path: str) -> str:
-        hasher = hashlib.sha256()
-        with open(file_path, 'rb') as f:
-            buf = f.read()
-            hasher.update(buf)
-        return hasher.hexdigest()
-        
-    @staticmethod
-    def _truncate_context_to_budget(docs, max_tokens=3000):
-        try:
-            enc = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            enc = tiktoken.get_encoding("gpt2")
-            
-        current_tokens = 0
-        truncated_docs = []
-        
-        for doc in docs:
-            doc_tokens = len(enc.encode(doc.page_content))
-            if current_tokens + doc_tokens > max_tokens:
-                logger.warning("Token budget exceeded. Truncating lower-ranked context chunks.")
-                break
-            current_tokens += doc_tokens
-            truncated_docs.append(doc)
-            
-        return truncated_docs
-
-    def _load_and_verify_documents(self):
-        new_documents = []
-        has_existing_vectors = False
-        
-        # Check if collection has any points (to determine NO_DOCS state)
-        collection_info = self.qdrant_client.get_collection(self.session_id)
-        if collection_info.points_count > 0:
-            has_existing_vectors = True
-
-        for file_path in glob.glob(f"{self.user_data_dir}/**/*", recursive=True):
-            if os.path.isfile(file_path):
-                # 4. Cryptographic SHA-256 Idempotency
-                file_hash = self._compute_file_hash(file_path)
-                
-                # Check Qdrant payload if this hash is already ingested
-                search_result = self.qdrant_client.scroll(
-                    collection_name=self.session_id,
-                    scroll_filter=Filter(
-                        must=[
-                            FieldCondition(
-                                key="metadata.file_hash",
-                                match=MatchValue(value=file_hash)
-                            )
-                        ]
-                    ),
-                    limit=1
-                )
-                
-                # 5. Incremental Upsert logic
-                if search_result[0]:
-                    logger.info(f"Skipping {file_path}: already ingested (Hash match).")
-                    has_existing_vectors = True
-                    continue
-                    
-                logger.info(f"Loading new document: {file_path}")
-                try:
-                    if file_path.endswith('.txt'):
-                        loader = TextLoader(file_path)
-                        docs = loader.load()
-                    elif file_path.endswith('.pdf'):
-                        loader = PyPDFLoader(file_path)
-                        docs = loader.load()
-                    elif file_path.endswith('.docx'):
-                        loader = Docx2txtLoader(file_path)
-                        docs = loader.load()
-                    elif file_path.endswith('.md'):
-                        loader = UnstructuredMarkdownLoader(file_path)
-                        docs = loader.load()
-                    elif file_path.endswith('.html'):
-                        loader = UnstructuredHTMLLoader(file_path)
-                        docs = loader.load()
-                    else:
-                        raise DocumentIngestionError(f"Unsupported file format: {os.path.basename(file_path)}. Currently supported: .txt, .pdf, .docx, .md, .html")
-                        
-                    # Append file_hash to payload metadata
-                    for d in docs:
-                        d.metadata["file_hash"] = file_hash
-                    
-                    new_documents.extend(docs)
-                except Exception as e:
-                    logger.error(f"Error loading {file_path}: {e}")
-                    raise DocumentIngestionError(f"Failed to load {file_path}") from e
-
-        if not new_documents and not has_existing_vectors:
-            logger.info("No documents found to ingest.")
-            return "NO_DOCS"
-            
-        vectorstore = QdrantVectorStore(
+    def _init_vectorstore(self):
+        self.vectorstore = QdrantVectorStore(
             client=self.qdrant_client,
             collection_name=self.session_id,
             embedding=self.embeddings,
@@ -169,18 +82,65 @@ class LocalRAGEngine:
             sparse_vector_name="sparse",
             retrieval_mode=RetrievalMode.HYBRID,
         )
+        self.retriever = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k": settings.retriever_k,
+                "fetch_k": settings.retriever_k * 3,
+                "lambda_mult": 0.6
+            }
+        )
+        self._setup_lcel_graph()
+
+    def ingest_single_document(self, filename: str, file_bytes: bytes) -> bool:
+        """Ingests a single document incrementally if its hash is brand new."""
+        hasher = hashlib.sha256()
+        hasher.update(file_bytes)
+        file_hash = hasher.hexdigest()
+
+        if file_hash in self.ingested_hashes:
+            logger.info(f"Skipping {filename}: already ingested (Hash match).")
+            return False
+
+        file_path = os.path.join(self.user_data_dir, filename)
+        with open(file_path, "wb") as f_out:
+            f_out.write(file_bytes)
+
+        logger.info(f"Loading new document: {filename}")
+        try:
+            if filename.endswith('.txt'):
+                loader = TextLoader(file_path)
+            elif filename.endswith('.pdf'):
+                loader = PyPDFLoader(file_path)
+            elif filename.endswith('.docx'):
+                loader = Docx2txtLoader(file_path)
+            elif filename.endswith('.md'):
+                loader = UnstructuredMarkdownLoader(file_path)
+            elif filename.endswith('.html'):
+                loader = UnstructuredHTMLLoader(file_path)
+            else:
+                raise DocumentIngestionError(f"Unsupported file format: {filename}")
             
-        if new_documents:
-            logger.info(f"Ingesting {len(new_documents)} new document chunks to Qdrant.")
+            docs = loader.load()
+            for d in docs:
+                d.metadata["file_hash"] = file_hash
+                
             text_splitter = SemanticChunker(
                 self.embeddings, 
                 breakpoint_threshold_type="percentile", 
                 breakpoint_threshold_amount=settings.chunk_percentile
             )
-            splits = text_splitter.split_documents(new_documents)
-            vectorstore.add_documents(documents=splits)
+            splits = text_splitter.split_documents(docs)
             
-        return vectorstore
+            if self.vectorstore == "NO_DOCS":
+                self._init_vectorstore()
+                
+            self.vectorstore.add_documents(documents=splits)
+            self.ingested_hashes.add(file_hash)
+            return True
+        except Exception as e:
+            logger.error(f"Error loading {filename}: {e}")
+            raise DocumentIngestionError(f"Failed to load {filename}") from e
 
     def _setup_lcel_graph(self):
         router_prompt = ChatPromptTemplate.from_messages([
@@ -208,7 +168,22 @@ class LocalRAGEngine:
             scored_docs = list(zip(docs, scores))
             scored_docs.sort(key=lambda x: x[1], reverse=True)
             top_docs = [doc for doc, score in scored_docs[:settings.reranker_top_n]]
-            return self._truncate_context_to_budget(top_docs)
+            
+            # Simple truncation
+            current_tokens = 0
+            truncated_docs = []
+            max_tokens = 3000
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception:
+                enc = tiktoken.get_encoding("gpt2")
+            for doc in top_docs:
+                doc_tokens = len(enc.encode(doc.page_content))
+                if current_tokens + doc_tokens > max_tokens:
+                    break
+                current_tokens += doc_tokens
+                truncated_docs.append(doc)
+            return truncated_docs
 
         self.retrieve_chain = RunnableLambda(resolve_query) | RunnableLambda(retrieve_and_rerank)
         
